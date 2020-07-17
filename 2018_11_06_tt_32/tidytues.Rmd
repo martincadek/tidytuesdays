@@ -1,0 +1,261 @@
+---
+title: "Tidy Tuesday 32"
+output: html_document
+---
+
+# Libraries
+These are the libraries that I'll be using for TidyTuesday 32.
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse) # To tidy.
+library(tmaptools) # To crop Raster File
+library(tmap) # To plot Map, and get Raster
+library(rnaturalearth) # To Get Shape File
+library(sf)
+library(spdplyr)
+```
+
+# Data
+Now to upload data from github. This step has to be done only once.
+
+```{r data, message=FALSE, warning=FALSE, results='hide'}
+url <- c("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2018-11-06/us_wind.csv")
+# This line needs to be run only once:
+download.file(url, destfile = "Data/us_wind.csv")
+# Run only this once data are downlaoded:
+us_wind <- read_csv("Data/us_wind.csv")
+```
+
+# Explore Data
+Some basic data exploration functions, nothing too fancy.
+
+```{r explore}
+dim(us_wind) # 24 columns and 58k of rows
+head(us_wind) # The file looks cleanish but some variables are labeled as "missing"
+# Test if there are any NAs:
+sum(is.na(us_wind)) # results in zero but if we View() data, it should be obvious, there's something wrong.
+```
+
+# Visualisation and summaries
+I've decided to explore my data visually / summarize them. There are some beautiful functions available to do this in one line but I am consciously going for ggplot2 solution with tidyr. The approach here is to separate data as either categorical or numerical and then visualize / summarize them.
+
+## Categorical
+
+```{r explore categorical summarise 1}
+# Looking at all categorical data is better via a simple summary
+# There are 10 categorical or character data
+us_wind %>%
+  select_if(funs(is.character)) %>%
+  gather(key = "var_name", value = "var_content") %>%
+  group_by(var_name, var_content) %>%
+  summarise(total = n())
+# I can use %>% View() to explore the values more closely
+```
+
+```{r explore categorical summarise 2}
+# We can see how many times missing occurs using the following lines
+us_wind %>%
+  select_if(funs(is.character)) %>%
+  gather(key = "var_name", value = "var_content") %>%
+  group_by(var_name, var_content) %>%
+  summarise(total = n()) %>%
+  arrange(desc(total)) %>% 
+  filter(var_content == "missing") # Five out of ten have missing values
+```
+
+```{r explore categorical plot}
+# Looking at this visually, it's better to use some cut-off value on total to reduce overplotting,
+# and overall plotting time.
+us_wind %>%
+  select_if(funs(is.character)) %>%
+  gather(key = "var_name", value = "var_content") %>%
+  group_by(var_name, var_content) %>%
+  summarise(total = n()) %>%
+  arrange(desc(total)) %>% 
+  filter(total > 500) %>%
+  ggplot(., aes(x = var_content, y = total)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~var_name, scales = "free")
+# For example, faa_asn, faa_ors are just missing and we see the "missing" label in other columns too.
+# It's clear we'll need to relabel "missing" as NA or deal with the missingness somehow.
+```
+
+## Numerical
+
+Once we visualized and summarized the categorical data, let's look at the numerical rest of data. In case of numerical data, I was able to pull of their visualization using the complete data.
+
+```{r explore numerical plot}
+# Takes a while as I am using the whole data
+# There are 14 numerical columns
+us_wind %>%
+  select_if(funs(is.numeric)) %>%
+  gather(key = "var_name", value = "var_content") %>%
+  ggplot(., aes(x = var_content)) +
+  geom_histogram() +
+  facet_wrap(~var_name, scales = "free")
+# The obvious pattern is that some values (particularly those at -10 000) are represented quite a few times.
+```
+
+```{r explore numerical summarise}
+# We can see the occurence of -9999 using the lines below...
+us_wind %>%
+  select_if(funs(is.numeric)) %>%
+  gather(key = "var_name", value = "var_content", -case_id) %>%
+  group_by(var_name, var_content) %>%
+  summarise(total = n()) %>%
+  filter(total > 500) %>%
+  arrange(desc(total)) %>%
+  filter(var_content == "-9999") # 7 out of 14 columns contains -9999
+```
+
+Without going into too much detail I can see that half of categorical variables are using labels "missing" and half of numerical are using label "-9999". After re-labeling these values as NAs, I can check if there are other missing values or issues. I am not really digging deep into this data though, and it's possible more issues could be found.
+
+# Relabeling
+I've decided to go with the approach to relabel "-9999" and "missing" inputs as NAs.
+
+```{r relabel NA}
+# Relabel "-9999" and "missing"
+us_wind_NA <-  us_wind %>%
+  mutate_all(funs(na_if(., "missing"))) %>%
+  mutate_all(funs(na_if(.,"-9999")))
+
+# Check number of NA
+sum(is.na(us_wind_NA)) # 93324
+```
+
+# Visualising without NAs
+I'll assume data are tidy now or "tidier" and visualize them without the NA values in them. I am going to split them into categorical and numerical again.
+
+## Categorical
+
+```{r categorical plot tidy}
+# Categorical 
+us_wind_NA %>%
+  select_if(funs(is.character)) %>%
+  gather(key = "var_name", value = "var_content") %>%
+  group_by(var_name, var_content) %>%
+  summarise(total = n()) %>%
+  arrange(desc(total)) %>% 
+  filter(total > 100) %>%
+  filter_all(all_vars(!is.na(.))) %>% # Exclude all NAs
+  ggplot(., aes(x = var_content, y = total)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~var_name, scales = "free")
+# I have decreased the total number. The NAs are removed but what seems to be the case now
+# is that some values are represented much more than others. I can plot the most common ones
+# and check if there's anything strange.
+```
+
+```{r categorical summarise tidy}
+us_wind_NA %>%
+  select_if(funs(is.character)) %>%
+  gather(key = "var_name", value = "var_content") %>%
+  group_by(var_name, var_content) %>%
+  summarise(total = n()) %>%
+  arrange(desc(total)) %>% 
+  filter_all(all_vars(!is.na(.))) %>% # Exclude all NAs
+  filter(total == max(total)) # Show most occuring values only
+# The only one that might be intuitively strange is "unknown Tehachapi Wind Resource Area 1"
+# Probablu could be relabeled as "unknown"
+```
+
+## Numerical
+
+```{r numerical plot tidy}
+# Numerical
+us_wind_NA %>%
+  select_if(funs(is.numeric)) %>%
+  gather(key = "var_name", value = "var_content") %>%
+  filter_all(all_vars(!is.na(.))) %>% # Exclude all NAs
+  ggplot(., aes(x = var_content)) +
+  geom_histogram() +
+  facet_wrap(~var_name, scales = "free")
+# After removing all NAs, numerical columns look fine on the first glance.
+```
+
+# Plot a map - Preparation
+Maps are probably one way to describe what is going on here. After completing this TidyTuesday, I saw other people's maps and my approach is quite basic here. What I though was interesting is to plot the data against a geographical feature. While I am not an expert, I though that an altitude could be interesting. It turned out to be a bit more work than I expected as I had to get a raster map that has altitude data. It turns out there's such a map (albeit in poor resolution) as data attached to tmap package (I hope it's tmap!).
+
+I am going to be simple here and just summarize number of plants without NAs and group them. I think it's a possible approach but there's one issue I don't like. By summarizing I got rid of longitude and latitude. My next step will be to join it back by left_join() but perhaps there's a nice way how to achieve it without losing this information. If anyone's reading it, I'd be grateful for a comment :).
+
+```{r data preparation map}
+# Summarise number of power plants from the dataset, exclude missing vars
+map_us_wind <- us_wind_NA %>%
+  mutate(t_state = paste0("US-", t_state)) %>% # Ensures state columns are identical
+  filter_all(all_vars(!is.na(.))) %>% # Removes NAs
+  group_by(t_state) %>% # Groups by state
+  summarise(N_of_Wind = n()) %>% # Total N
+  ungroup() # Removes grouping
+```
+
+I am using rnaturalearth to obtain polygon shape file of the USA. It's really nice package to use for this task. I've discovered it only recently, so this is an ideal opportunity to try it out. Only issue is that I wanted only certain states, for example not Hawaii. I do not know how to call only specific parts from the natural earth, hence I am simply filtering them out with a spdplyr package (essentially a dplyr for shape files; and really cool package).
+
+```{r shape file}
+# Get shapefile of USA using natural earth database
+usa <- ne_states(country = "United States of America")
+```
+
+I am obtaining the raster map from tmap. I'll need to crop it against the polygon file. I've used crop function that's part of tmaptools.
+
+```{r raster}
+# Get raster of the same
+data("land") # Load data from tmap
+
+```
+
+Here I am filtering out states and then joining the summarized us_wind data with them into a single shape file.
+
+```{r filter US states}
+# I need only States, not all of USA. I am using iso_3166_2 to get only
+# the states I need. This is quite crude method but I did not figure out
+# how to do it differently.
+
+# The method relies on package spdplyr for manipulating shapefiles.
+states_fortyeight <- c("US-AL", "US-AZ", "US-AR", "US-CA", "US-CO", "US-CT", "US-DE", "US-FL", "US-GA", "US-ID", "US-IL", "US-IN", "US-IA", "US-KS", "US-KY", "US-LA", "US-ME", "US-MD", "US-MA", "US-MI", "US-MN", "US-MS", "US-MO", "US-MT", "US-NE", "US-NV", "US-NH", "US-NJ", "US-NM", "US-NY", "US-NC", "US-ND", "US-OH", "US-OK", "US-OR", "US-PA", "US-RI", "US-SC", "US-SD", "US-TN", "US-TX", "US-UT", "US-VT", "US-VA", "US-WA", "US-WV", "US-WI", "US-WY")
+usa <- usa %>% filter(iso_3166_2 %in% states_fortyeight) %>% 
+  left_join(., map_us_wind, by = c("iso_3166_2" = "t_state")) # Merge with wind total
+```
+
+Below, I am obtaining only part of the raster map. The part relevant to the USA.
+
+```{r crop raster file}
+# crop shap is from tmap tools
+usa_raster_crop <- crop_shape(land, usa) # get only selection of raster
+```
+
+
+# Plot a map - Plotting
+Now I am ready to plot both raster with altitude and polygon shape file with us_wind data. For quite a while I was trying to plot them across each other as layers. This wasn't readable though. It's better to plot them next to each other using a function from tmap package.
+
+```{r plot raster}
+# Save USA raster
+usa_raster_wind1 <- tm_shape(usa_raster_crop) +
+  tm_raster("elevation", 
+            palette = terrain.colors(10),
+            title = "Elevation") +
+  tm_credits("TidyTuesday 32",
+             position = c("left", "bottom")) +
+  tm_layout(title = "Wind Turbines in US", 
+            title.position = c("left", "top"),
+            legend.position = c("right", "bottom"), 
+            frame = FALSE)
+```
+
+```{r plot polygon}
+# Save USA Wind poly
+usa_poly_wind2 <- tm_shape(usa) +
+  tm_polygons("N_of_Wind", title = "Number of Wind Turbines", 
+              palette = "-Blues")  + 
+tm_layout(legend.position = c("right", "bottom"), 
+          frame = FALSE)
+```
+
+## Final plot
+For the final result, see below:
+
+```{r combine raster and polygon}
+# Combine both together and plot it.
+tmap_arrange(usa_raster_wind1, usa_poly_wind2)
+```
+
+That's all I did. I am sure you can dig deeper into the data, I've used just a small information from the original data. If you would like to leave a comment, please don't hesitate.
