@@ -1,0 +1,385 @@
+---
+title: "Tidy Analysis of Cocktails - Part I - EDA"
+date: 2020-06-07
+categories: ["R"]
+tags: ["machine learning", "clustering"]
+format:
+        hugo-md:
+                output-file: "index_draft"
+                output-ext:  "md"
+                fig-width: 8
+                fig-height: 5
+draft: true
+execute: 
+        warning: false
+knitr:
+        opts_chunk:
+                fig.path: ""
+---
+
+```{r setup_local, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE) # Hide all code chunks
+options(digits = 2)
+options(scipen = 999)
+
+# Libraries ---------------------------------------------------------------
+pkgs <- c("tidyverse", "tidymodels", "here", "colorspace",
+          "janitor", "showtext", "patchwork", "ggthemes", 
+          "lubridate", "flextable", "tidytext", "arrow", "klaR", 
+          "tidytuesdayR", "ggimage", "rsvg", "conflicted", "viridis",
+          "flextable", "ggrepel")
+
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+conflict_prefer("filter", "dplyr")
+conflict_prefer("select", "dplyr")
+
+
+# Themes, fonts, labels ---------------------------------------------------
+# Set theme
+default_theme <- theme_clean() + # requires ggplot
+        theme(
+                # text = element_text(family = "Nunito"),
+                axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5),
+                plot.background = element_blank()
+        )
+
+dark_theme <- function(...) {
+        theme(
+                # text = element_text(family = "Nunito"),
+                legend.text = element_text(color = "white"),
+                legend.background = element_rect(fill = "#1e1e1e", color = "#1e1e1e"),
+                legend.key = element_rect(fill = "#1e1e1e"),
+                title = element_text(colour = "white"),
+                axis.text = element_text(color = "white"), 
+                axis.line = element_line(color = "white"), 
+                axis.line.x.bottom = element_blank(),
+                axis.line.y.left = element_blank(),
+                axis.title = element_text(color = "white"),
+                axis.ticks = element_blank(),
+                panel.border = element_blank(),
+                panel.background = element_blank(),
+                plot.background = element_rect(fill = "#1e1e1e", color = "#1e1e1e"),
+                strip.background = element_rect(fill = "#1e1e1e"),
+                strip.text = element_text(colour = "white"),
+                ...
+        )
+}
+
+old_theme <- theme_gray() # in case I need to revert back to original theme
+
+theme_set(default_theme)
+
+# Colours
+c_blue <- "#2D98D9"
+c_red <- "#DE6B97"
+c_orange <- "#BF8521"
+c_green <- "#59A229"
+
+# Fonts
+# Source: https://fonts.google.com/featured/Superfamilies
+# font_add_google("Nunito", "Nunito")
+# font_families()
+# showtext_auto()
+
+# Graphical device
+# options("device" = "windows")
+# options("device")
+# options("device" = "RStudioGD")
+# knitr::opts_knit$set(dev.args = list(type = "cairo"))
+```
+
+```{r libraries, include=FALSE}
+pkgs
+```
+
+## Background story about carrots and parsnips
+
+Some time ago, I wanted to use machine learning so I have learned to use the [caret](https://topepo.github.io/caret/) developed by Max Kuhn. Caret was my choice (and for some problems I would use it again) because it offers pretty much every ML algorithm I can think of - it is very comprehensive. It also makes it possible to use these algorithms a unified and consistent way. This was also the first time I realised how useful it is to have a common framework or package "universe".
+
+However, there are some downsides when you wish to use caret:
+
+* First, the package relies on a lot of dependencies, and to install and set-up them in a reproducible environment can be a pain. I think the author did not initially expect the package to become so comprehensive.
+
+* Second, if your machine or internet connection is not the fastest then it is going to take a while. 
+
+* Third, some packages simply remain quirky and difficult to use in caret interference, and lastly, speed - caret is not the fastest package. 
+
+There are more niche things which depend on your domain use, but I think these are the key downside I see. They make the use of the package somewhat inconvenient at the time but nothing you cannot resolve if you still want to use it. That said, I was very excited when I have learned that [parsnip](https://parsnip.tidymodels.org/) - a package similar to caret was developed. Like caret, parsnip promises [consistency](https://www.tidyverse.org/blog/2018/11/parsnip-0-0-1/) across various modelling packages in R. Parsnip does this faster and in a more unified interference (universe) of packages called [Tidymodels](https://www.tidymodels.org/).
+
+## What is this post about?
+
+The post is about two things. First, It's been some time since I have attempted [Tidy Tuesday](https://github.com/rfordatascience/tidytuesday) and it's also been on my to-do list to familiarise myself with the Tidymodels and a little bit of parsnip.
+
+The post is two parts. In the first, I will utilise Tidy Tuesday dataset and show an example of basic exploratory data analysis (EDA). I will be doing some data manipulation and coercion using Tidyverse and preparing the data for the second part. I will also develop (I will call it) a research question for this dataset.
+
+In the second part, I will take the data and show a basic example of clustering using the Tidymodels framework.
+
+I think this post may illustrate how a question or objective of analysis through EDA is developed and some basic features of the aforementioned packages (plus hopefully some clustering).
+
+If you don't want to follow me alongside in this post and just want to download the scripts for R, please use this [repository](https://github.com/martincadek/tidytuesdays/tree/master/2020_05_26_tt_22) on GitHub and open the `script.R` file. The second part is accessible via this - [link to the part II](https://www.martincadek.com/posts/tidy-analysis-cocktails-part-ii/).
+
+Feel free to reuse any of the parts with appropriate attribution.
+
+## Cocktails data from Tidy Tuesday 22 (2020)
+
+The dataset I am using here is available from Tidy Tuesday 22 (26/05/2020) and describes various cocktails and their content. I was inspired by the idea of clustering various cocktails published on [Five Thirty Eight](https://fivethirtyeight.com/videos/we-got-drunk-on-margaritas-for-science/) and though this would be the perfect opportunity to play with the Tidymodels. They have utilised k-means clustering algorithm to assess what are the four main types of margaritas.
+
+## Used packages
+
+Below are the packages I am going to use throughout this project (both part I and II). 
+
+```{r required_packages, results='markup'}
+simplify2array(pkgs, packageVersion)
+```
+
+Below is a slice from the `SessionInfo()` output so you can see if you are running similar setup. I am trying to use the latest available packages as of the June 2020. The source files are provided in the following [repository](https://github.com/martincadek/tidytuesdays/tree/master/2020_05_26_tt_22).
+
+```{r session_info, results='markup'}
+#> R version 4.0.2 (2020-06-22)
+#> Platform: x86_64-w64-mingw32/x64 (64-bit)
+#> Running under: Windows 10 x64 (build 18363)
+```
+
+## Load data
+
+I have already downloaded and saved the data (as `.rds`). Two files are available for the Tidy Tuesday 22 - I will focus on datafile `cocktails.csv` as it should be more analysis-ready. The other file, `boston_cocktails.csv` is not used here because it is messier and would require more cleaning.
+
+```{r data, echo=TRUE}
+tt_cocktails <- tidytuesdayR::tt_load(x = "2020-05-26")
+data <- tt_cocktails$cocktails
+cocktails <- tt_cocktails$cocktails
+data <- data %>%
+  select(-c(iba, video)) # drop iba and video columns with lot of NAs
+```
+
+## Opening data
+
+After opening the data, I want to quickly see what I am tackling here. At this stage, I have only a vague idea about the data. I simply want to familiarise myself with it - understand the variables, missing values, potential errors (whether systematic or unique).
+
+```{r explore_data}
+glimpse(cocktails)
+```
+
+There are 2104 rows and 13 columns (or 2104 observations and 13 variables) before any further coercion. I am now going to look at the types of variables in dataset. The code below displays several variable types in the cocktails the dataset. There are is one date (POSIxct + POSIXt), three numeric or integer variables, the rest is categorical or character. However; a closer look reveals these data are mostly categorical and some further cleaning is needed. For example, the `measure` contains unit value and volume. EDA should give me better ideas about the questions I want to ask here.
+
+```{r explore_data_types}
+table(data.frame(unlist(sapply(cocktails, class))))
+```
+
+## Exploratory data analysis (EDA)
+
+With every dataset, I want to make sure I understand what the variables represent. First, what are the observations? In this case, each observation represents an ingredient which belongs to a cocktail. This can be further understood when looking at the "raw" source of data [here](https://www.kaggle.com/ai-first/cocktail-ingredients).
+
+In the previous overview, I saw 13 variables. I will quickly interpret each. The `row_id`, `drink_id`, and `drink` are in theory the same things represented differently - they are the drink. The `date_modified` is likely a date when the entry was made to the database. The `alcoholic` refers to a version of a drink, i.e. alcoholic or non-alcoholic. The `category` refers to the type of drink (e.g.: shot). The `drink_thumb` is an image associated with a drink. The `glass` refers to the serving glass of drink. I will not bother much with `iba` and `video`, as shown later, they are mostly missing but the first stands for "International Bartenders association category" while the latter for "Video to how to make". The `ingredient_number` refers to the order of ingredients in a drink. The `ingredient` is what a drink consists of, and finally, the `measure` is in what quantity an ingredient exists in a drink.
+
+**Word of caution.** What I find a little tricky with datasets like this (but it is a very common feature of datasets, not an error). Except for `ingredient`, `ingredient_number`, and `measure`, the other variables can be grouped. To be precise, there is no point counting `glass`, `alcoholic`, and `category` without grouping all variables by `drink_id`. The resulting number without grouping would be the count of all of `r nrow(cocktails)` rows containing "alcohol" when there are only `r length(unique(cocktails$drink))` drinks! If I were precise the variables I have mentioned should be called, for example, `drink_glass` and variables like `measure`, for example, `ingredient_measure` to differ which relate to what. This will become clearer as I progress with the EDA and analysis.
+
+At this stage, I can see that most variables are in what is called "nominal" scale of measurement. This can be changed with further aggregations across `drink_id`, `row_id`, and `drink` (and I will need to do this). That way I will be able to get, for example, how many drinks containing gin are there and a "new" variables in "ratio" scale.
+
+The `ingredient_number` and `date_modified` are the only variables not in the nominal scale of measurement. The `ingredient_number` tells me the maximum number of ingredients possible, i.e. `r max(cocktails$ingredient_number)` and minimum, i.e. `r min(cocktails$ingredient_number)` and in sense of measurement is in "ordinal" scale. It also makes me think of another aspect of the data - the complexity. The more combinations of ingredients, the more complex it is. This starts to probe into questioning the dataset. For example, how complex are the drinks? I quite fancy gin, are there some complex ones? How do they differ from the simple ones? Now, the `date_modified` is in something called an `interval` scale of measurement but I am not going to make use of this variable. 
+
+Lastly, the `measure` surely contains some information about quantity. It does but needs to be cleaned further. For example, "1 oz white" should be "1" and then "oz" (the white is shown in ingredient). That way I can get some sense of quantity to compare and get the variable from "nominal" to "interval" or possibly "ratio" scale if I standardise the values.
+
+I will now look at the missing variables.
+
+```{r missing_values_table}
+cocktails %>% summarise_all(~sum(is.na(.))) %>%
+  flextable() %>%
+  theme_zebra(odd_header = "#CFCFCF",
+              odd_body = "#EFEFEF",
+              even_header = "#CFCFCF",
+              even_body = "#EFEFEF")
+```
+
+The variables `date_modified`, and `alcoholic` contain a small number of NA. The variables `iba` and `video` are almost entirely made out of NAs. I believe it is safe to remove `iba`, `video`. I don't think I can guess or do anything with date but filling the alcoholic should be straightforward if I can see the content of drink based on the ingredients.
+
+Now, I want to run EDA on cocktails dataset. I will first summarise and visualise anything numerical and date, then I will move to strings and logical variables. I am also going to save each type as following temporary data frames ("t_") and count the number of cocktails and their ingredients.
+
+```{r create_data_subsets, echo=TRUE}
+t_categorical <- data %>% 
+     select_if(list(Negate(is.numeric))) %>% 
+     select(-date_modified) %>%
+     mutate_all(as.factor)
+
+t_numerical <- data %>% 
+     select_if(Negate(is.character))
+
+ingr_per_cocktail <- t_numerical %>% select(id_drink) %>% group_by(id_drink) %>% count() %>% pull(n)
+```
+
+### Numerical
+
+The `summary()` function from `base` R package is sufficient to show the numerical data
+
+```{r numerical_summary, results='markup'}
+summary(t_numerical, maxsum = 10)
+```
+
+To reiterate, none of the variables classed as numeric are numeric in sense of ratio scale. The `row_id` and `drink_id` are simply more convenient names for the cocktails.
+
+I can also see that the actual number of drinks in the dataset is (n = `r length(ingr_per_cocktail)`) as per the `row_id`. Therefore, there are `r length(ingr_per_cocktail)` unique cocktails. I will not visualise the id variables because the graphs would not provide any more information than what I have just described. However, I would like to see the other variables, so I will use a series of histograms and bar plots to visualise the data.
+
+```{r plot_ingredient_complexity, echo=FALSE, message=FALSE, fig.height = 8, fig.width = 8, fig.align = "center"}
+ingr_per_drinks <- t_numerical %>%
+    count(id_drink) %>%
+    mutate(id_drink = as.factor(id_drink)) %>% 
+    pull(n) %>% table() %>% as_tibble()
+
+gg_id_drink1 <- t_numerical %>%
+  count(id_drink) %>%
+  mutate(id_drink = as.factor(id_drink)) %>% 
+  slice_max(n = 20, order_by = n) %>%
+  ggplot(aes(x = fct_reorder(id_drink, n,  .desc = TRUE), y = n)) +
+  geom_col() +
+  scale_y_continuous(n.breaks = 12) +
+  labs(title = "The ingredient-heavy drinks (grouped by drink id)", x = NULL, y = NULL)
+
+gg_id_drink2 <- t_numerical %>%
+  count(id_drink) %>%
+  mutate(id_drink = as.factor(id_drink)) %>% 
+  slice_min(n = 1, order_by = n) %>%
+  ggplot(aes(x = fct_reorder(id_drink, n,  .desc = FALSE, ), y = n)) +
+  geom_col() +
+  scale_y_continuous(n.breaks = 2) +
+  labs(title = "The ingredient-light drinks (grouped by drink id)", x = NULL, y =
+         NULL)
+
+gg_ingr <- t_numerical %>%
+  distinct(id_drink, ingredient_number) %>%
+  ggplot(aes(x = ingredient_number)) +
+  geom_histogram(bins = 12) +
+  scale_x_continuous(n.breaks = 12) +
+  labs(title = "Frequency of ingredient order", x = NULL, y = NULL)
+
+gg_date <- t_numerical %>%
+  select(date_modified) %>%
+  mutate(date_modified = ymd_hms(date_modified)) %>%
+  ggplot(aes(x = date_modified)) +
+  geom_histogram() +
+  scale_x_datetime(date_breaks = "1 month") +
+  labs(title = "Dates", x = NULL, y = NULL)
+
+(gg_id_drink1 / gg_id_drink2) + 
+  plot_annotation(caption = "by @m_cadek; #TidyTuesday 2020") & 
+  dark_theme()
+```
+
+```{r plot_dates_ingredients, fig.height = 6, fig.width = 8, fig.align = "center"}
+(gg_ingr + gg_date) + 
+  plot_annotation(caption = "by @m_cadek; #TidyTuesday 2020") &  
+  dark_theme()
+```
+
+The graphs above show various features of ingredients, ingredients order, and date. I can make several observations.
+
+The first two panels show the drinks grouped by the number of ingredients. The top panel shows the most ingredient "heavy" drinks (i.e., they have 7 or more ingredients), and then the second panel shows the most ingredient "light" drinks (i.e., drinks with only a single ingredient). There are only `r ingr_per_drinks %>% filter(. == "1") %>% pull(n)` drinks with a single ingredient. These are followed by `r ingr_per_drinks %>% filter(. == "2") %>% pull(n)` drinks with two ingredients. There is also only `r ingr_per_drinks %>% filter(. == "12") %>% pull(n)` drink with 12 ingredients, followed by `r ingr_per_drinks %>% filter(. == "11") %>% pull(n)` drinks with up to 11 ingredients and cut-off at `r ingr_per_drinks %>% filter(. == "7") %>% pull(n)` with 7 ingredients.
+
+This observation leads nicely to the graph at the bottom left, it is not surprising to see that the order of ingredients is heavily skewed - in other words, it shows that each cocktail has at least 1 ingredient, few have more than 8, and only one has 12 ingredients. The common number of ingredients in a drink is `r median(ingr_per_cocktail)` if I use median, and `r mean(ingr_per_cocktail)` if mean is used.
+
+Finally, the bottom right graph shows dates - most of the observations are "newer", they have been made between August and October 2017. I could look at when these observations are stored (e.g., hours) but I do not think that is very useful. 
+
+The information provided thus far makes me convinced that my questions should make use of the grouped dataset, ingredient's order, and ingredients themselves. Time to move onto the categorical variables.
+
+### Categorical
+
+Again, the summary function in R can show what categorical variables am I dealing with and which are possible to visualise (e.g., they do not have a large number of levels or "Other" values). For example, `drink`, `drink_thumb` (picture), `ingredient`, and `measure` have large number of levels and would not make a good bar chart because of this.
+
+```{r categorical_summary, results='markup'}
+summary(t_categorical, maxsum = 5)
+```
+
+From the summary, I can see that there several categories which could be useful for further analyses and filtering. For example, I am thinking that the analysis could focus only on "alcoholic drinks" to ensure more consistency. I can also see the `drink` names which occur most often and have the most ingredients, e.g. Angelica Liqueur is quite complex (that is the 12 ingredient one) and looking at some sort of drink complexity could be useful. I also see that vodka appears to be the most common ingredient which is followed by gin, and sugar. Additionally, the measure seems to include some funky levels, such as "n" which is not a measure but a new paragraph line and leftover from scraping that should be removed.
+
+At this point, I am thinking that there are simply too many ingredients to focus on them all. Therefore, narrowing the dataset could provide better insight. For example, I like gin so I could focus on drinks containing gin, this also makes only alcoholic drinks the viable option.
+
+Some variables could  variables be difficult to visualise because of the number of their levels. I will supplement this by using three simple descriptive tables on variables that had too many levels to visualise, i.e. `ingredient`, and `measure.` I will not show drink as that would essentially lead to showing the ingredient heavy and ingredient light drinks again (from the previous output). I will do the tabular summaries and then the visualisations of categorical variables.
+
+```{r table_frequent_ingredients}
+t_categorical %>%
+  count("The most frequent ingredients" = ingredient) %>%
+  slice_max(n = 10, order_by = n) %>%
+  rename("Frequency" = n) %>%
+  flextable(cwidth = 3) %>%
+  theme_zebra(odd_header = "#CFCFCF",
+              odd_body = "#EFEFEF",
+              even_header = "#CFCFCF",
+              even_body = "#EFEFEF")
+```
+The table above provides a good idea about the most common/frequent ingredients. Vodka, gin, and sugar lead the way by far. I have limited the table to the top 10 ingredients to avoid large summaries and it is not informative to look at all the different ingredients because I am more curious what could be the common ingredients to further narrow my analysis at.
+
+
+The second table shows the most frequent measures of the various ingredients.
+
+```{r table_frequent_measures}
+t_categorical %>%
+  count("The frequent measures" = measure) %>%
+  slice_max(n = 10, order_by = n) %>%
+  rename("Frequency" = n) %>%
+  flextable(cwidth = 3) %>%
+  theme_zebra(odd_header = "#CFCFCF",
+              odd_body = "#EFEFEF",
+              even_header = "#CFCFCF",
+              even_body = "#EFEFEF")
+```
+First, note the "empty" row. This is, in fact, the `/newspace` I have mentioned already - this needs to be removed. The most common measure seems to be "1 oz", then "1/2", and "2", "oz" seems to be also the typical unit of measure. It is clear that the `measure` is a mix of volume and unit and will need to be further cleaned using functions such as `str_split` or `separate`. I will try to do this using regular expressions.
+
+The variables which are "safe" to visualise are `alcoholic`, `category`, and `glass` as they do not have a large number of levels and should be safe to plot. I will need to group these by `drink` name because otherwise, I would run into the issue I have warned about earlier.
+
+I will start with the `alcoholic` variable.
+
+```{r plot_alcoholic_analysis, fig.height = 6, fig.width = 8, fig.align = "center"}
+gg_alc1 <- t_categorical %>%
+  distinct(drink, alcoholic) %>%
+  count(alcoholic) %>%
+  ggplot(aes(x = fct_reorder(alcoholic, -n), y = n)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Frequency of drink versions", x = NULL, y = NULL)
+
+
+gg_alc2 <- data %>%
+  ggplot(aes(x = row_id, color = alcoholic)) +
+  geom_freqpoly(bins = 100, binwidth = 20) + 
+  labs(title = "Frequency of observations across drink version", x = NULL, y = NULL, color = "Drink version")
+
+gg_glas <- t_categorical %>%
+  distinct(drink, glass) %>%
+  count(glass) %>%
+  ggplot(aes(x = fct_reorder(glass, -n), y = n)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Frequency of the type of a glass", x = NULL, y = NULL)
+
+gg_cat <- t_categorical %>%
+  distinct(drink, category) %>%
+  count(category) %>%
+  ggplot(aes(x = fct_reorder(category, -n), y = n)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Frequency of drink category", x = NULL, y = NULL)
+
+gg_alc1 / gg_alc2 + 
+  plot_annotation(caption = "by @m_cadek; #TidyTuesday 2020") & 
+  dark_theme()
+```
+
+```{r plot_category_glass, fig.height = 6, fig.width = 8, fig.align = "center"}
+gg_cat / gg_glas + 
+  plot_annotation(caption = "by @m_cadek; #TidyTuesday 2020") & 
+  dark_theme()
+```
+
+The final pair of bar plots should be straightforward to interpret, the plots show the most common levels for each variable. Notably, drinks served in cocktail glass, and drinks categorised as ordinary are the most common.
+
+### Summary
+
+*What did I learn about the data?* The exploratory analysis revealed that there is `r length(ingr_per_cocktail)` of cocktails with average `r mean(ingr_per_cocktail)` ingredients in each. The most common type of drink is alcoholic, and most likely the drinks are served in cocktail glass. There are cocktails such as Angelica Liqueur which seem to be awfully complex and four drinks which are essentially one ingredient. I also need to be careful and appropriately group by drink names or ids to ensure I am not creating nonsensical summaries or values. There are also some issues requiring coercion, namely, the `measure` variable needs to be cleaned further, it also contains some missing values (likely due to the web scraping).
+
+*What questions can I ask?* The analysis should narrow down the scope. I've decided to further explore complexity of the drinks and its ingredients. To do that, I need to focus on one ingredient as the main with the other ingredients as "complementary". I am curious to see more about gin drinks, so questions I am asking here are - What drinks contain gin? What are the simple, or complex gin drinks? What are the other ingredients defining gin drinks? What other features and qualities such drinks have?
+
+These and related questions will be explored in the following post. To go and read the post, please follow this [link to the part II](https://www.martincadek.com/posts/tidy-analysis-cocktails-part-ii/).
+
+### Reproducibility disclaimer
+Please note that this is an older post. While I can guarantee that the code below will work at time the post was published, R packages are updated regularly and it is possible that the code will not work in the future. Please see below the R.version to see the last time the code was checked. Future post will improve on this.
+
+```{r r_version_disclaimer, message=FALSE, warning=FALSE}
+R.version
+```

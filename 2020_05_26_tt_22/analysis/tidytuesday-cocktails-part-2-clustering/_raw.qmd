@@ -1,0 +1,978 @@
+---
+title: "Analysis of Cocktails Data - Part II - Exploratory k-means Clustering"
+date: 2020-06-10
+categories: ["R"]
+tags: ["machine learning", "clustering"]
+format:
+        hugo-md:
+                output-file: "index_draft"
+                output-ext:  "md"
+                fig-width: 8
+                fig-height: 5
+draft: true
+execute: 
+        warning: false
+knitr:
+        opts_chunk:
+                fig.path: ""
+---
+
+```{r setup_local, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE) # Hide all code chunks
+options(digits = 2)
+options(scipen = 999)
+
+# SETUP -------------------------------------------------------------------
+# Packages
+# install.packages("pkgs")
+pkgs <- c("tidyverse", "tidymodels", "here", "colorspace",
+          "janitor", "showtext", "patchwork", "ggthemes", 
+          "lubridate", "flextable", "tidytext", "arrow", "klaR", 
+          "tidytuesdayR", "ggimage", "rsvg", "conflicted", "viridis", 
+          "flextable", "ggrepel")
+
+
+
+invisible(lapply(pkgs, library, character.only = TRUE))
+conflict_prefer("filter", "dplyr")
+conflict_prefer("select", "dplyr")
+
+# Set theme
+default_theme <- theme_clean() + # requires ggplot
+     theme(
+       # text = element_text(family = "Nunito"),
+       axis.text.x = element_text(angle = 90, hjust = 0.5, vjust = 0.5),
+       plot.background = element_blank()
+       )
+
+dark_theme <- function(...) {
+    theme(
+      # text = element_text(family = "Nunito"),
+      legend.text = element_text(color = "white"),
+      legend.background = element_rect(fill = "#1e1e1e", color = "#1e1e1e"),
+      legend.key = element_rect(fill = "#1e1e1e"),
+      title = element_text(colour = "white"),
+      axis.text = element_text(color = "white"), 
+      axis.line = element_line(color = "white"), 
+      axis.line.x.bottom = element_blank(),
+      axis.line.y.left = element_blank(),
+      axis.title = element_text(color = "white"),
+      axis.ticks = element_blank(),
+      panel.border = element_blank(),
+      panel.background = element_blank(),
+      plot.background = element_rect(fill = "#1e1e1e", color = "#1e1e1e"),
+      strip.background = element_rect(fill = "#1e1e1e"),
+      strip.text = element_text(colour = "white"),
+      ...
+      )
+  }
+
+old_theme <- theme_gray() # in case I need to revert back to original theme
+
+theme_set(default_theme)
+
+# Colours
+c_blue <- "#2D98D9"
+c_red <- "#DE6B97"
+c_orange <- "#BF8521"
+c_green <- "#59A229"
+
+# LOAD DATA ---------------------------------------------------------------
+tt_cocktails <- tidytuesdayR::tt_load(x = "2020-05-26")
+data <- tt_cocktails$cocktails
+data <- data %>%
+  select(-c(iba, video)) # drop iba and video columns with lot of NAs
+# * 2 * PART --------------------------------------------------------------
+# Tidy --------------------------------------------------------------------
+data_tidy <- data %>%
+  # Remove drink image
+  select(-drink_thumb) %>%
+  mutate( 
+    # Trim white space from measure
+    measure = str_trim(measure),
+    # Trim repeated white space from measure
+    measure = str_squish(measure),
+    # Change letter case
+    measure = str_to_lower(measure)
+    # Extract values of measure
+  ) %>%
+  ## Extract the numeric values from measure, there are three notable types (possibly more)
+  ## Fraction, i.e., 1/2 or 2 1/2, Decimals, i.e., 1.5, and "dashes", i.e. 1 - 2
+  ## The code below extracts these values into separate new columns
+  mutate(measure_vol_frc = str_extract(measure, "^([0-9]*(\\s?\\d*\\/\\d)?)"),
+         measure_vol_dec = str_extract(measure, "([0-9]+(?:\\.[0-9]+)?)"),
+         measure_vol_dsh = str_extract(measure, "([0-9]+(?:\\-[0-9]+)?)"),
+         measure_unit = str_extract(
+           string = measure, 
+           pattern = "[a-zA-Z]+ [a-zA-Z]+ [a-zA-Z]+ [a-zA-Z]+|[a-zA-Z]+ [a-zA-Z]+ [a-zA-Z]+|[a-zA-Z]+ [a-zA-Z]+|[a-zA-Z]+"
+           ),
+         # Remove any white space in new measure
+         across(starts_with("measure"), str_trim)) %>%
+  ## The regex above does not handle the fractions very well and leaves
+  ## the first parts of them, e.g. 1 from 1 / 2 in the _dec and _dsh.
+  ## The following replaces it to the NA...
+  mutate(
+    ## ...for decimals type, i.e. 1.5
+    measure_vol_dec = 
+      case_when(
+        str_detect(string = measure_vol_dec, pattern = "\\.") == TRUE ~ measure_vol_dec,
+        str_detect(string = measure_vol_dec, pattern = "\\.") == FALSE ~ NA_character_
+      ),
+    ## ...for dash type, i.e. 1 - 2 (reads as 1 to 2)
+    measure_vol_dsh =
+      case_when(
+        str_detect(string = measure_vol_dsh, pattern = "\\-") == TRUE ~ measure_vol_dsh,
+        str_detect(string = measure_vol_dsh, pattern = "\\-") == FALSE ~ NA_character_
+      )
+    ## It can't be done in my view for fractions as it would also remove the whole numbers,
+    ## e.g. 16 as NA. So I do not do it for fractions and accept there might be some hiccups.
+  ) %>% 
+    ## Turn empty rows into NA for R to be able to handle it.
+  mutate(measure_vol_frc = na_if(x = measure_vol_frc, y = ""),
+         ## Now, turn "fractions" into decimals. Save as "_new"
+         measure_new = map_dbl(sub(" ", "+", measure_vol_frc), ~ eval(parse(text = .x))),
+         measure_vol_dec = as.double(measure_vol_dec), 
+         # Merge with frc_ and _dec
+         # NOTE: The _dsh is left out and lower boundary value is used, e.g. 1 from 1 - 2.
+         measure_new = 
+           case_when(
+             is.na(measure_vol_dec) ~ measure_new,
+             !is.na(measure_vol_dec) ~ measure_vol_dec,
+             TRUE ~ measure_new
+           ),
+         # Convert oz, cl, l, etc. to ml units
+         measure_ml =
+           # Note, be careful not to match something multiple times!
+           case_when(
+             str_detect(measure_unit, "ml") == TRUE ~ measure_new,
+             str_detect(measure_unit, "^cl$") == TRUE ~ measure_new * 10,
+             str_detect(measure_unit, "^l$") == TRUE ~ measure_new * 1000,
+             str_detect(measure_unit, "^oz") == TRUE ~ measure_new * 28,
+             str_detect(measure_unit, "shot") == TRUE ~ measure_new * 30, # 44.36 was again too much. rounded up to 30
+             str_detect(measure_unit, "cup") == TRUE ~ measure_new * 250,
+             str_detect(measure_unit, "pint") == TRUE ~ measure_new * 473,
+             str_detect(measure_unit, "^splash") == TRUE ~ measure_new * 3.5,
+             str_detect(measure_unit, "^part") == TRUE ~ measure_new * 5, # Initially I put it as 44.36 but that created a massive outlier, putting 1 part as = 5 ml seemed reasonable
+             str_detect(measure_unit, "^jigger") == TRUE ~ measure_new * 30,
+             str_detect(measure_unit, "^dash") == TRUE ~ measure_new * 0.60,
+             is.na(measure_unit) ~ measure_new,
+             TRUE ~ NA_real_
+           ),
+         #  ...OR use scale in exchange for interpretability.
+         measure_stdz = as.vector(scale(measure_new))) %>% 
+  # select(ingredient, measure_ml, measure, measure_unit) %>%
+    # This replaces few NA values in alcoholic (see; cocktails %>% summarise_all(~sum(is.na(.))))
+  mutate(
+    alcoholic = case_when(
+      drink == "Cherry Electric Lemonade" ~ "alcoholic",
+      TRUE ~ as.character(alcoholic)
+      )
+    ) %>%
+  mutate(
+    # Change letter case
+    glass = str_to_lower(glass),
+    category = str_to_lower(category),
+    alcoholic = str_to_lower(alcoholic),
+    ingredient = str_to_lower(ingredient),
+    # Fill missing values in alcoholic Cherry Electric Lemonade
+    
+    # Coerce vars to factors
+    across(.cols = c(alcoholic, category, glass, ingredient), .fns = as.factor), 
+    # make the ingredient number an integer
+    ingredient_number = as.integer(ingredient_number), 
+    # Coerce vars to date
+    date_modified = ymd_hms(date_modified), 
+    # Collapse selected levels in glass
+    glass = fct_collapse(glass, 
+                         `beer glass` = c("beer glass", "beer mug", "beer pilsner"),
+                         `margarita glass` = c("margarita glass", "margarita/coupette glass"),
+                         `coffee mug` = c("coffee mug", "irish coffee cup"),
+                         `wine glass` = c("white wine glass", "wine glass")),
+    # Collapse ingredients below 11 into separate level
+    ingredient_and_others = fct_lump_min(ingredient, min = 11, other_level = "uncommon ingredient")
+           ) %>%
+    # Create a column called original_ingredient
+  mutate(original_ingredient = ingredient)
+
+# * 3 * PART --------------------------------------------------------------
+
+# Explore tidy ------------------------------------------------------------
+gg_tidy_glass <- data_tidy %>%
+  ggplot(aes(x = fct_infreq(glass))) +
+  geom_bar() +
+  labs(title = "Frequent glass type", x = NULL, y = NULL)
+
+gg_alc_glass <- data_tidy %>%
+  count(alcoholic, glass) %>%
+  ggplot(aes(x = reorder_within(glass, -n, alcoholic), y = n)) +
+  geom_bar(stat = "identity") +
+  scale_x_reordered() +
+  facet_wrap(~alcoholic, scales = "free_x") +
+  labs(title = "Frequent glass type across alcoholic and other drinks", x = NULL, y = NULL)
+
+# Visualisation of glass type (after coercion)
+gg_tidy_glass / gg_alc_glass +
+  plot_annotation(caption = "by @m_cadek; #TidyTuesday 2020") & 
+  dark_theme()
+
+gg_alc_category <- data_tidy %>%
+  count(alcoholic, category) %>%
+  ggplot(aes(x = reorder_within(category, -n, alcoholic), y = n)) +
+  geom_bar(stat = "identity") +
+  scale_x_reordered() +
+  facet_wrap(~alcoholic, scales = "free_x") +
+  labs(title = "Frequent category across alcoholic and other drinks", x = NULL, y = NULL)
+
+# Visualisation of alcoholic / non-alc
+gg_alc_category + 
+  labs(caption = "by @m_cadek; #TidyTuesday 2020") + 
+  dark_theme()
+
+gg_common_ingr <- data_tidy %>%
+  filter(ingredient_and_others != "uncommon ingredient") %>%
+  ggplot(aes(x = fct_infreq(ingredient_and_others))) +
+  geom_bar() +
+  labs(title = "Frequent ingredients", x = NULL, y = NULL)
+
+# Visualisation of common ingredients
+gg_common_ingr +
+labs(caption = "by @m_cadek; #TidyTuesday 2020") + 
+dark_theme()
+
+gg_common_ingr_in_ord <- data_tidy %>%
+  count(ingredient_number, ingredient, sort = TRUE) %>%
+  group_by(ingredient_number) %>%
+  slice_max(n, n = 3) %>% 
+  ggplot(aes(x = reorder_within(ingredient, -n, ingredient_number), y = n)) +
+  geom_bar(stat = "identity") +
+  scale_x_reordered() +
+  scale_y_continuous(n.breaks = 4) +
+  facet_wrap(~ingredient_number, scales = "free", ) +
+  labs(title = "Frequent ingredients and as they are added", x = NULL, y = NULL)
+
+# Visualisation of common ingredients as they are added
+gg_common_ingr_in_ord +
+  labs(caption = "by @m_cadek; #TidyTuesday 2020") +
+  dark_theme()
+
+
+# Series of visualisations regarding the measure unit (ml) after coercion
+scaled_d_t <- data_tidy %>%
+  mutate(measure_ml = as.vector(scale(measure_ml)))
+
+# Comparison of scaled and raw ml units (scaled uses all units across) across all data
+# The scaled measure scaled all of the data in measure new (i.e., standard score from oz, tbps, etc.)
+# The ml measure converted most of liquid scales to ml (should be more specific)
+gg_raw_measure <- (ggplot(data = data_tidy) +
+  geom_histogram(aes(x = measure_ml, fill = "Milliliters"), bins = 40) +
+  scale_fill_manual(values = c("Milliliters" = c_blue)) +
+    scale_x_sqrt() +
+  labs(fill = "Legend", y = "Density", x = NULL)) +
+  (ggplot(data = data_tidy) +
+  geom_histogram(aes(x = measure_stdz, fill = "Scaled"), bins = 40) +
+    scale_fill_manual(values = c("Scaled" = c_red)) +
+    scale_x_sqrt() +
+  labs(fill = "Legend", y = NULL, x = NULL)) +
+  plot_annotation(subtitle = "Comparison of measure in raw and scaled units", 
+                  caption = "Square root of x transformation") +
+  plot_layout(guides = "collect") &
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.line.x = element_blank(),
+        legend.background = element_blank(),
+        legend.title = element_blank(),
+        legend.key.size = unit(1,"line"))
+
+# Comparison of scaled and raw ml units (scaled uses all units across) in gin drinks
+gg_gin_measure <- ggplot(data = scaled_d_t %>%
+                        filter(ingredient == "gin")) +
+  geom_density(aes(x = measure_ml, colour = "Scaled milliliters"), size = 1.5) +
+  geom_density(aes(x = measure_stdz, colour = "Scaled all"), size = 1.5) +
+  scale_colour_manual(values = c("Scaled milliliters" = c_blue, 
+                                 "Scaled all" = c_red)) +
+  labs(subtitle = "Gin drinks", colour = "Legend", y = "Density", x = NULL)
+
+# Comparison of scaled and raw ml units (scaled uses all units across) in alcoholic drinks
+gg_alc_measure <- ggplot(data = scaled_d_t %>%
+                        filter(alcoholic == "alcoholic")) +
+  geom_density(aes(x = measure_ml, colour = "Scaled milliliters"), size = 1.5) +
+  geom_density(aes(x = measure_stdz, colour = "Scaled all"), size = 1.5) +
+  scale_x_log10() +
+  scale_colour_manual(values = c("Scaled milliliters" = c_blue, 
+                                 "Scaled all" = c_red)) +
+  labs(subtitle = "Alcoholic drinks", colour = "Legend", y = "Density", x = NULL)
+
+# Comparison of scaled and raw ml units (scaled uses all units across) in all drinks
+gg_all_measure <- ggplot(data = scaled_d_t) +
+  geom_density(aes(x = measure_ml, colour = "Scaled milliliters"), size = 1.5) +
+  geom_density(aes(x = measure_stdz, colour = "Scaled all"), size = 1.5) +
+  scale_x_log10() +
+  scale_colour_manual(values = c("Scaled milliliters" = c_blue, 
+                                 "Scaled all" = c_red)) +
+  labs(subtitle = "All drinks", colour = "Legend", y = "Density", x = NULL)
+
+# Patched comparison of measure in raw and scaled units
+gg_raw_measure +
+  plot_annotation(caption = "by @m_cadek; #TidyTuesday 2020") & 
+  dark_theme()
+
+# Patched comparison of measure units across gin, alcoholic, and all drinks
+gg_gin_measure / gg_alc_measure / gg_all_measure + 
+  plot_annotation(caption = "*logarithm to base 10\n by @m_cadek; #TidyTuesday 2020") +
+  plot_layout(guides = "collect") & theme(axis.text.x = element_blank(),
+                                          axis.ticks.x = element_blank(),
+                                          axis.line.x = element_blank(),
+                                          legend.background = element_blank(),
+                                          legend.title = element_blank(),
+                                          legend.key.size = unit(1,"line")) &
+  dark_theme()
+
+# ANALYSIS ----------------------------------------------------------------
+# A] Nest data -----------------------------------------------------------
+# Nest alcoholic and gin drinks
+system.time(
+data_gin_nested <- data_tidy %>%
+  # Remove non-alcoholic drinks and other drinks # The first filter.
+  filter(alcoholic == "alcoholic") %>%
+  # Nesting
+  group_by(drink, id_drink, row_id) %>%
+  nest() %>%
+  # pluck("data") %>% head # sanity check
+  # Get a column where I can show only drinks with gin, I like gin.
+  # Use map()
+  mutate(
+    gin_true = map(data, select, ingredient),
+         gin_true = map(gin_true, filter, ingredient == "gin"),
+         gin_true = map(gin_true, pull, ingredient),
+         gin_true = map(gin_true, str_detect, pattern = "gin"),
+         gin_true = map_lgl(gin_true, any)
+    ) %>%
+  # Include only drinks containing gin! # The second filter.
+  filter(gin_true == "TRUE")
+            ) # Measure elapsed time, takes about
+
+
+# [optional] SAVE - parquet -----------------------------------------------
+## WRITE
+# write_parquet(data_gin_nested %>%
+#                  # Unnest and save as parquet file which will have few KB
+#                unnest(cols = c(data)),
+#                "data/tidy/data_gin_unnested.parquet")
+## READ
+# data_gin_nested <- read_parquet(file = here("data/tidy/data_gin_unnested.parquet"),
+#                                as_tibble = TRUE)
+
+data_gin_unnested <- data_gin_nested %>% 
+  unnest(cols = c(data))
+
+
+# Narrow the focus --------------------------------------------------------
+# Let's focus only on alcoholic drinks containing gin; I'll split it to data
+# about other ingredients in gin and data about gin ingredient specifically
+
+# Note, 127 of measures in ml are NA of which 36 are probably intentional.
+# It usually concerns awkward measures such as splash, or measures for mixed 
+# contents (solid and liquid) such as spoon. See below:
+
+summary(data_gin_unnested)
+na_ml_index <- which(is.na(data_gin_unnested$measure_ml))
+data_gin_unnested %>% 
+  mutate(rows_numbers = row_number()) %>%
+  filter(rows_numbers %in% na_ml_index) %>%
+  count(measure_unit, ingredient, sort = TRUE) %>%
+  print(n = 60)
+
+# Prepare data with only gin as ingredient - used for visualising complexity
+only_gin_data <- data_gin_unnested %>%
+  ungroup() %>%
+  select(-c(row_id, id_drink, category, date_modified, measure, original_ingredient, gin_true, alcoholic)) %>%
+  group_by(drink) %>%
+  mutate(total_ingredients = max(ingredient_number)) %>%
+  filter(ingredient == "gin") 
+# calculate measure and importance of gin
+
+# Prepare data without gin as ingredient - used for visualising ingredients
+no_gin_data <- data_gin_unnested %>%
+  # Remove columns that won't be used
+  ungroup() %>%
+  select(-c(row_id, id_drink, date_modified, measure, original_ingredient, gin_true, alcoholic)) %>%
+  # Aggregate by drinks and compute total number of ingredients
+  group_by(drink) %>%
+  mutate(total_ingredients = max(ingredient_number)) %>%
+  # Summary excluding gin!
+  filter(ingredient!= "gin") %>%
+  group_by(ingredient) %>%
+  mutate(freq_non_gin_ingredients = n()) %>%
+  ungroup() %>%
+  mutate(prop_non_gin_ingredients = freq_non_gin_ingredients/n()*100)
+
+# Visualisations of gin drinks complexity (Only gin)
+(gg_heat_drink_complexity <- only_gin_data %>%
+    ggplot(aes(fct_reorder(drink, total_ingredients), 
+               ingredient, fill = total_ingredients)) + 
+    scale_fill_viridis(
+      discrete = FALSE,
+      guide = guide_colorbar(
+        direction = "horizontal",
+        barheight = unit(2, units = "mm"),
+        barwidth = unit(80, units = "mm"),
+        draw.ulim = TRUE,
+        title.position = "left",
+        title.hjust = 0.5,
+        title.vjust = 1,
+        label.hjust = 0.5
+      ))  +
+    geom_tile(width = 0.7, height = 2) +
+    labs(title = "Complexity of gin drinks", 
+         caption = "*Gin was included as one of the ingredients\n by @m_cadek; #TidyTuesday 2020",
+         x = NULL, y = NULL, fill = "Total number of ingredients:") + 
+    dark_theme(axis.text.y = element_blank(),
+               axis.ticks.y = element_blank(),
+               panel.grid.major.y = element_blank(),
+               legend.position = "bottom")) 
+
+# Visualisations of common ingredients in gin drinks
+(gg_heat_gin <- no_gin_data %>%
+  ggplot(aes(drink, fct_reorder(ingredient, freq_non_gin_ingredients), fill = freq_non_gin_ingredients)) + 
+    scale_fill_viridis(
+      discrete = FALSE,
+      guide = guide_colorbar(
+        direction = "vertical",
+        barheight = unit(50, units = "mm"),
+        barwidth = unit(2, units = "mm"),
+        draw.ulim = TRUE,
+        title.position = "top",
+        title.hjust = 0.5,
+        title.vjust = 1,
+        label.hjust = 0.5
+        ))  +
+  geom_point(shape = 21, size = 3) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(title = "Common ingredients in gin drinks", 
+       subtitle = "Colour represents frequency (commonness) of ingredient across all drinks",
+       caption = "*Gin excluded from overall frequency\n by @m_cadek; #TidyTuesday 2020",
+       x = NULL, y = NULL, fill = "Frequency of \ningredient") +
+  dark_theme())
+
+
+# Finally, graph about importance of gin ingredient in drink (by measure ml)
+(gg_gin_importance_ml <- only_gin_data %>%
+  mutate(icon_gin = case_when(
+    measure_ml == 310.52000 ~ "wine",
+    TRUE ~ NA_character_
+    )) %>% 
+    filter(!is.na(measure_ml)) %>%
+  ggplot(aes(y = fct_reorder(drink, measure_ml), x = measure_ml, group = ingredient)) +
+  ## The ggimage works by using icons from https://ionicons.com/ & https://github.com/ionic-team/ionicons/find/master
+  ## You need to create new column with the icon name
+  ## This name is used in geom_icon. list.icon() does not do anything.
+  ## Package function is poorly documented.
+  # geom_icon(aes(y = 65, x = 200, by = "height",
+  #               image = icon_gin), colour = "white", size = 0.5, na.rm = TRUE,
+  #           alpha = 0.5) +
+  stat_summary_bin(fun = mean, bins = 30, colour = "white", alpha = 0.8, geom = "line", na.rm = TRUE) +
+  geom_point(aes(size = measure_ml), 
+             show.legend = FALSE, 
+             colour = c_blue, 
+             alpha =  0.8, na.rm = TRUE) +
+  scale_x_continuous(name = "volume [ml]") +
+  labs(title = "Gin volume in the drinks",
+        x = NULL, y = NULL, caption = "by @m_cadek; #TidyTuesday 2020") +
+  coord_flip() +
+  dark_theme(axis.text.x = element_text(colour = "white", 
+                                        angle = 90, 
+                                        hjust = 1, 
+                                        vjust = 0)))
+
+
+# Prepare k-means data ----------------------------------------------------
+# Let's prepare numerical data which can be used in k-means
+aggregated_gin <- data_gin_unnested %>%
+  group_by(drink) %>%
+  # I will create:
+  # * sum of ingredients, 
+  # * approximate sum of volume, 
+  # * approximate average ingredient volume, and 
+  # * approximate proportion of gin
+  # It is approximate because the ml unit were computed only roughly.
+  summarise(sum_ingredients = n(),
+            aprx_sum_volume_ml = sum(measure_ml, na.rm = TRUE),
+            aprx_avg_ingredient_volume_ml = mean(measure_ml, na.rm = TRUE),
+            aprx_prop_of_gin_ml = case_when(
+              ingredient == "gin" ~ measure_ml/aprx_sum_volume_ml
+            )) %>%
+  arrange(-aprx_prop_of_gin_ml) %>%
+  ungroup() %>%
+  drop_na() %>% 
+  # I'll save drink names as rownames to keep the labels. K means accepts only numerical values.
+  column_to_rownames(var = "drink")
+
+# Visualise k-means data  -------------------------------------------------
+# Visualise the aggregated data to show what is k-means utilised on
+set.seed(2020)
+(gg_aggregated <- ggplot(aggregated_gin, aes(y = aprx_sum_volume_ml, x = aprx_avg_ingredient_volume_ml, 
+                           colour = aprx_prop_of_gin_ml, alpha = sum_ingredients)) +
+  geom_jitter(size = 5, width = 2, height = 2) +
+  guides(colour = guide_legend("Gin proportion")) +
+  scale_alpha_continuous(range = c(0.5, 1), guide = FALSE) +
+  scale_colour_viridis(alpha = 1) +
+  labs(title = "Aggregated data about gin drinks",
+       subtitle = 
+       "Total volume vs average volume is plotted on axes. The alpha shows number of ingredients,\nthe colour represents how much gin is in a given drink.",
+       y = "Total volume [ml]", x = "Average volume of ingredients [ml]",
+       caption = "*alpha indicates number of ingredients, added jitter\nby @m_cadek; #TidyTuesday 2020") +
+  dark_theme())
+
+# What the data look like
+
+
+# Let's run the k-mean algorithm on the aggregated data
+kmeans_summary <- 
+  tibble(k = 1:8) %>%
+  mutate(
+    # Do the cluster analysis from one to 8 clusters
+    kmeans = map(k, ~kmeans(aggregated_gin, centers = .x)),
+    # Show summary per each cluster
+    kmeans_tidy = map(kmeans, tidy),
+    # Show summary of key statistics
+    kmeans_glan = map(kmeans, glance),
+    # Clusters with the original data
+    kmeans_augm = map(kmeans, augment, aggregated_gin)
+  )
+
+# Show clusters
+kmeans_summary
+
+# Extract statistics ------------------------------------------------------
+# glance() function extracts a summary stats for models
+clusters_statistics <- kmeans_summary %>%
+  unnest(cols = c(kmeans_glan))
+
+# tidy() function summarizes per cluster stats
+clusters_summary <- kmeans_summary %>%
+  unnest(cols = c(kmeans_tidy))
+
+# augment adds predicted classifications to the original data set
+data_predicted <- kmeans_summary %>% 
+  unnest(cols = c(kmeans_augm))
+
+# Visualise ---------------------------------------------------------------
+
+# Now we can plot the original points using the data from augment(), 
+# with each point coloured according to the predicted cluster.
+set.seed(2020)
+# Show the visualisation of predicted clusters across the data
+(gg_predicted <- ggplot(data_predicted, aes(y = aprx_sum_volume_ml, x = aprx_avg_ingredient_volume_ml, 
+                           colour = .cluster)) +
+  geom_jitter(size = 3, alpha = 0.5, width = 2, height = 2) +
+  guides(colour = guide_legend("Clusters")) +
+  scale_color_discrete_qualitative(palette = "Dark 3") +
+  labs(y = "Total volume [ml]", 
+       x = "Average volume of ingredients [ml]",
+       caption = "*added jitter\nby @m_cadek; #TidyTuesday 2020") +
+  facet_wrap(~ k, ncol = 2) +
+  dark_theme())
+
+set.seed(2020)
+# Show the predicted clusters and their centroids
+(gg_centres <- gg_predicted + geom_point(data = clusters_summary %>% 
+                                           rename(".cluster" = cluster),
+                          size = 4, fill = "white", shape = 22,
+                          alpha = 0.8) + 
+    guides(colour = guide_legend("Clusters \n& centers"),
+           fill = guide_legend("Clusters \n& centers")))
+
+# Visualise the predicted clusters with labels
+row_names_labels <- c("Gin Swizzle", "Ace", "Negroni", "White Lady", "Gin Fizz", "Casino", "Martini", "Casino Royale", "Pink Gin",
+                      "Abbey Cocktail", "Cherry Electric Lemonade", "Dragonfly", "Orange Oasis", 'French "75"')
+
+set.seed(2020)
+(gg_predicted_labels <- ggplot(data_predicted, aes(y = aprx_sum_volume_ml, x = aprx_avg_ingredient_volume_ml, 
+                           colour = .cluster)) +
+    geom_jitter(size = 3, alpha = 0.5, width = 2, height = 2) +
+    guides(colour = guide_legend("Clusters")) +
+    scale_color_discrete_qualitative(palette = "Dark 3") +
+    facet_wrap(~ k, ncol = 2) +
+    geom_point(data = clusters_summary %>% 
+                 rename(".cluster" = cluster),
+               size = 4, fill = "white", shape = 22,
+               alpha = 0.8) + 
+    geom_text_repel(data = data_predicted %>%
+                      filter(.rownames %in% row_names_labels),
+                    aes(label = .rownames), 
+                    segment.size  = 0.2,
+                    force = 2, max.iter = 10000,
+                    max.overlaps = 15,
+                    segment.color = "grey50") +
+    guides(colour = guide_legend("Clusters \n& centers"),
+           fill = guide_legend("Clusters \n& centers")) +
+    labs(title = "Predicted clusters",
+         subtitle = "Manual label was added to interesting points close to centroids",
+         y = "Total volume [ml]", 
+         x = "Average volume of ingredients [ml]",
+         caption = "*added jitter\nby @m_cadek; #TidyTuesday 2020") +
+    dark_theme())
+
+
+# Elbow method ------------------------------------------------------------
+
+# cluster (300 values) contains information about each point
+# centers, withinss, and size (3 values) contain information about each cluster
+# totss, tot.withinss, betweenss, and iter (1 value) contain information about the full clustering
+
+# Show the elbow graph
+(gg_elbow <- ggplot(clusters_statistics, aes(k, tot.withinss)) +
+    geom_line(size = 1.5, color = "white") +
+    geom_point(size = 3, color = c_red) +
+    scale_x_continuous(n.breaks = 8, name = "Number of clusters (k)") +
+    scale_y_continuous(name = "Total within cluster sum of squares") +
+    dark_theme() +
+    labs(subtitle = "Elbow method estimating the optimal number of clusters",
+         caption = "by @m_cadek; #TidyTuesday 2020"))
+
+
+```
+
+## Background
+
+This is the second part of the two-part post. The first part is accessible via this - [link to the part I](https://www.martincadek.com/posts/tidy-analysis-of-cocktails-part-i/). Please read the first part for the background information or the relevant [Tidytuesday](https://github.com/rfordatascience/tidytuesday/tree/master/data/2020/2020-05-26) repository. If you just want to download the scripts for R, please use this [repository](https://github.com/martincadek/tidytuesdays/tree/master/2020_05_26_tt_22) on GitHub and open the `script.R` file.
+
+## What is the blog post about?
+
+In the second part, I am going to prepare the data for analysis and show an example of exploratory clustering using the Tidymodels framework. The analysis is inspired by [Five Thirty Eight](https://fivethirtyeight.com/videos/we-got-drunk-on-margaritas-for-science/) and tidymodels [tutorial](https://www.tidymodels.org/learn/statistics/k-means/) which is great reading if you want to get into this method. 
+
+This part will be less wordy and feature more visualisations. While I will also show some of the code in this part, I deliberately wanted to avoid this and I rather encourage you to download the full script - especially if you want to see some of the coercion, and the ggplot2 code behind the graphs.
+
+Feel free to reuse any of the parts with appropriate attribution.
+
+## Used packages
+
+These packages were used throughout both part I and part II of the projects. Please see the previous [link to the part I](https://www.martincadek.com/posts/tidy-analysis-of-cocktails-part-i/) for further comments on reproducibility.
+
+```{r package_versions, results='markup'}
+do.call(rbind, sapply(pkgs, packageVersion))
+```
+
+
+## Used data
+For a reminder, I am working with the following dataset. This is the version of the dataset before further cleaning and tidying.
+
+```{r show_data_sample}
+as_tibble(head(data)) %>%
+  flextable() %>%
+  theme_zebra(odd_header = "#CFCFCF",
+              odd_body = "#EFEFEF",
+              even_header = "#CFCFCF",
+              even_body = "#EFEFEF")
+```
+
+## Choosing the algorithm
+The method applied in here is called [k-means (p.460)](https://web.stanford.edu/~hastie/ElemStatLearn/). This method relies on numerical variables (as it requires the computation of Euclidean distance matrix) and although it is possible to transform categorical or ordinal variables (via dummy coding / one-hot encoding), such approach is [discouraged](https://www.ibm.com/support/pages/node/418861). That said, there are some alternatives, for example, see this [discussion](https://datascience.stackexchange.com/questions/22/k-means-clustering-for-mixed-numeric-and-categorical-data) or [this](https://towardsdatascience.com/clustering-on-mixed-type-data-8bbd0a2569c3) and [this](https://arxiv.org/pdf/1304.6478.pdf). 
+
+I used k-means as it is a simple ML algorithm, and at least with my setup, it is relatively resource-light. The algorithms such as K-modes or Gower distance are a suitable alternative when the assumptions fit, but I found them slow (*I wonder if other folks have better experience optimising these techniques on high-dimensional categorical data?*).
+
+## Tidying & data manipulation
+The tidying I've done is discussed briefly. It is included in the full script at the following [GitHub repository](https://github.com/martincadek/tidytuesdays/tree/master/2020_05_26_tt_22) - `script.R`. While the data was relatively clean to begin with, I still needed to engineer it and prepare it for the clustering analysis via the k-means method. 
+
+Here is the summary of what I did:
+
+* Trimmed and cleaned all character variables
+
+* Extracted numerical quantity from the measure volume
+
+* Converted quantity from the measure column to millilitres (where it was sensible)
+
+* Standardised character vectors and their letter case
+
+* Standardised the date variable
+
+* Removed any missing or corrupt rows
+
+* Removed drink the image column
+
+* Created variables with collapsed factor levels for a number of variables
+
+Once tidied, the data looked like this (some columns were removed due to space):
+
+```{r show_tidy_data_sample}
+as_tibble(head(data_tidy)) %>%
+  select(-c(measure, measure_vol_frc, measure_vol_dec, ingredient_number, original_ingredient)) %>%
+  flextable() %>%
+  theme_zebra(odd_header = "#CFCFCF",
+              odd_body = "#EFEFEF",
+              even_header = "#CFCFCF",
+              even_body = "#EFEFEF")
+```
+
+## Further visualisations
+The tidy-er data allowed me to show additional visualisations that were not possible previously.
+
+I'll start by re-introducing some of the variables.
+
+First, the glass type. Not much has changed at first glance after tidying (I merged some levels and cleaned them). The variable seems to be skewed towards certain types (such as collins) of glass. I won't be working with this variable - although it would be possible.
+
+```{r plot_glass_types, fig.height = 6, fig.width = 8, fig.align = "center"}
+# Visualisation of glass type (after coercion)
+gg_tidy_glass / gg_alc_glass +
+  plot_annotation(caption = "by @m_cadek; #TidyTuesday 2020") & 
+  dark_theme()
+```
+
+The following graph confirms that the alcoholic drinks were the most prevalent. I focused specifically on those (by filtering out `non alhocolic` and `optionally alcoholic`). The ordinary drink was also a common type of drink.
+
+```{r plot_alcoholic_categories, fig.height = 6, fig.width = 8, fig.align = "center"}
+# Visualisation of alcoholic / non-alc
+gg_alc_category + 
+  labs(caption = "by @m_cadek; #TidyTuesday 2020") + 
+  dark_theme()
+```
+
+Cleaned ingredients show that vodka or gin lovers would be lucky with this dataset. I focused on the gin ingredient in the analysis that follows.
+
+```{r plot_common_ingredients, fig.height = 6, fig.width = 8, fig.align = "center"}
+# Visualisation of common ingredients
+gg_common_ingr +
+labs(caption = "by @m_cadek; #TidyTuesday 2020") + 
+dark_theme()
+```
+
+I also tried to see if there was some pattern in the order at which the ingredients are added (there was). Notice that usually the signature alcohol was added first (by signature I mean it being important or particularly noticeable in the drink). That was followed either by another important alcohol ingredient or a variety of juices. Added later were the aesthetics, like colouring.
+
+If you are barista and you start with sugar, you may be unorthodox.
+
+```{r plot_ingredient_order, fig.height = 6, fig.width = 8, fig.align = "center"}
+# Visualisation of common ingredients as they are added.
+gg_common_ingr_in_ord +
+  labs(caption = "by @m_cadek; #TidyTuesday 2020") +
+  dark_theme()
+```
+
+The `measure` variable took the most effort to prepare because of the way it was stored initially. The format, e.g. `1 oz of lime juice` was convenient for human readability but not for analytical purpose. My approach was to extract all numeric values using regex, then extract the unit values such as `oz`, and finally convert the values to a sensible measurement scale, millilitres (*I still fail to grasp where the beauty lies in the imperial system of units*).
+
+The first graph is the millilitres converted as part of `if_else` (`case_when`), and then without such conversion as standardised z-scores. Millilitres were used further as standardising, e.g. 8 litres doesn't make it comparable to 8 millilitres (notice difference in density and outliers).
+
+```{r plot_measure_comparison, fig.height = 6, fig.width = 8, fig.align = "center"}
+# Patched comparison of scaled and raw ml units (scaled uses all units across) across all data
+# The scaled measure scaled all of the data in measure new (i.e., standard score from oz, tbps, etc.)
+# The ml measure converted most of liquid scales to ml (should be more specific)
+gg_raw_measure +
+  plot_annotation(caption = "by @m_cadek; #TidyTuesday 2020") & 
+  dark_theme()
+```
+
+I also compared z-standardised ml and all other units. The difference was quite striking in the case of gin drinks - this confirmed that where direct conversion can be utilised it is superior to scaling different units.
+
+```{r plot_measure_units, fig.height = 6, fig.width = 8, fig.align = "center"}
+# Patched comparison of measure units across gin, alcoholic, and all drinks
+gg_gin_measure / gg_alc_measure / gg_all_measure + 
+  plot_annotation(caption = "*logarithm to base 10\n by @m_cadek; #TidyTuesday 2020") +
+  plot_layout(guides = "collect") & theme(axis.text.x = element_blank(),
+                                          axis.ticks.x = element_blank(),
+                                          axis.line.x = element_blank(),
+                                          legend.background = element_blank(),
+                                          legend.title = element_blank(),
+                                          legend.key.size = unit(1,"line")) &
+  dark_theme()
+```
+
+## Data nesting and unnesting
+
+Now that the data were tidied, I needed to extract only drinks containing gin while keeping all other variables (other ingredients, glass, etc.) This was a perfect use case for nested rows/columns in my opinion. After columns were nested, I utilised functional programming features of the `purrr` package to create a column confirming the drink contains gin and then filtered out based on this column.
+
+The following script does what I have just described.
+
+```{r nest_gin_data, eval=FALSE, echo=TRUE}
+# Nest alcoholic and gin drinks
+system.time(
+data_gin_nested <- data_tidy %>%
+  # Remove non-alcoholic drinks and other drinks # The first filter.
+  filter(alcoholic == "alcoholic") %>%
+  # Nesting
+  group_by(drink, id_drink, row_id) %>%
+  nest() %>%
+  # Use map()
+  mutate(
+    gin_true = map(data, select, ingredient),
+         gin_true = map(gin_true, filter, ingredient == "gin"),
+         gin_true = map(gin_true, pull, ingredient),
+         gin_true = map(gin_true, str_detect, pattern = "gin"),
+         gin_true = map_lgl(gin_true, any)
+    ) %>%
+  # Include only drinks containing gin! # The second filter.
+  filter(gin_true == "TRUE")
+            ) # Measure elapsed time, takes about
+
+```
+
+I have also tried to extend the data with `parsnip`'s capabilities of creating dummy variables for all ingredients. The idea was then to convert it to a distance matrix and utilise Gower algorithm or k-modes, but that ended up being a big no. The final matrix was far too large to be meaningfully processed and the `data.frame` itself took 2GB of memory. 
+
+I wouldn't recommend this route unless you can use cloud servers to do the computation or somehow optimise it. Even then it is not guaranteed that clustering ingredients would uncover something.
+
+## Zoom-in on gin drinks
+
+Once I filtered out non-gin drinks from nested data, I unnested them again and started looking at the data through more targeted visualisations.
+
+I liked the idea of utilising some form of complexity measure. The best I came up with was to simply measure the complexity as a number of ingredients required. The following visualisations show this.
+
+```{r plot_gin_complexity, fig.height = 8, fig.width = 9, fig.align = "center"}
+# Visualisations of gin drinks complexity (Only gin)
+gg_heat_drink_complexity
+```
+
+I also described the common ingredients in the drinks. 
+
+```{r plot_gin_ingredients, fig.height = 9, fig.width = 9, fig.align = "center"}
+# Visualisations of common ingredients in gin drinks
+gg_heat_gin
+```
+
+Both graphs show interesting features of gin drinks. That is, most gin drinks have 3 - 4 ingredients (the Complexity graph; note to self: try the Radioactive Long Island Iced Tea), and lemon juice, grenadine, or dry vermouth (the Common ingredients graph) are the popular choice of ingredients, but not 7-up.
+
+If you are concerned about the content of gin in the drinks, then hold my drink. Here's the graph utilising the measure (ml) to show which drinks you could go for. This doesn't account for the total volume of drink - that said, if you fancy a lot of gin, I suspect the Vesper, Jitterbug, Derby, Abbey Martini, and Ace might be your friends?
+
+
+```{r plot_gin_volume, fig.height = 8, fig.width = 9, fig.align = "center"}
+# Finally, graph about importance of gin ingredient in drink (by measure ml)
+gg_gin_importance_ml
+```
+
+## Data aggregation (feature engineering)
+
+Now for the final parts of the analysis. Before running the algorithm I had to do a few simple data aggregation procedures. I counted the number of ingredients (total), an approximate sum of total volume content (ml) in each drink, approximate average volume per ingredient, and finally, approximate proportion of gin content in the drink. 
+
+When I state "approximate" it means that the measurement unit (ml) was converted from raw data with custom-made functions, therefore, some differences could occur. For example, to measure a shot I had to define shot as 30 ml. This was a little bit of trial and error, but the graph with gin volume (shown above) in drinks was good guidance in terms of any outliers produced systematically through conversion.
+
+These aggregated (or feature engineered) variables formed the basis of the distance matrix computed using the Euclidean distance (`kmeans` function in R handles this). 
+
+The sum of squared distances Euclidean distances is defined as the within-cluster variation. Other algorithms (such as hierarchical clustering) require the user to compute distance themselves as different distance fits different contexts.
+
+The following script prepared the final dataset:
+
+```{r aggregate_gin_data, eval=FALSE, echo=TRUE}
+aggregated_gin <- data_gin_unnested %>%
+  group_by(drink) %>%
+  # Create:
+  # * sum of ingredients, 
+  # * approximate sum of volume, 
+  # * approximate average ingredient volume, and 
+  # * approximate proportion of gin
+  # It is approximate because the ml unit was computed only roughly.
+  summarise(sum_ingredients = n(),
+            aprx_sum_volume_ml = sum(measure_ml, na.rm = TRUE),
+            aprx_avg_ingredient_volume_ml = mean(measure_ml, na.rm = TRUE),
+            aprx_prop_of_gin_ml = case_when(
+              ingredient == "gin" ~ measure_ml/aprx_sum_volume_ml
+            )) %>%
+  arrange(-aprx_prop_of_gin_ml) %>%
+  ungroup() %>%
+  drop_na() %>% 
+  # Save drink names as rownames to keep the labels. K means accepts only numerical values.
+  column_to_rownames(var = "drink")
+
+```
+
+## Exploratory clustering with k-means
+
+The clustering conducted here was exploratory in the sense that I did not know of suitable k (number of) clusters to predict in advance. 
+
+A good indicator of whether clustering could be worthwhile is to visualise the data and see if some points form distinctive groups.
+
+The visualisation below shows the aggregated data, and (indeed) some of the points were fairly close together while being far from the others. There could be something?
+
+```{r plot_aggregated_data, fig.height = 8, fig.width = 9, fig.align = "center"}
+# Visualise the aggregated data to show what is k-means utilised on
+gg_aggregated
+```
+
+Running the k-means in the tidymodels framework was very satisfying. The code shown below implements the optimal approach (ideal would be to also split data to train and test). As I was not aware of any given number of clusters, 1 to 8 were specified (k = 1:8) and then map functions were used to initiate the algorithm and iterate it eight times across the entire dataset. The map functions saved the result of the algorithm as list columns.
+
+In next step, I am using three key `broom` package functions - `glance` (function extracts a summary stats for models), `tidy` (function summarizes per cluster stats), and `augment` (augment adds predicted classifications to the original data set) to extract data about the models. 
+
+* The way I think of glance is that it shows summary statistics and diagnostics from the perspective of the whole model. Not participants or clusters (or other groups).
+
+* In tidy, I go a level down, each iteration of the model produced several clusters and for each cluster, there are specific summary statistics. Tidy shows these cluster-level statistics.
+
+* Finally, with augment, I get the participants data. It's the predicted values for each separate drink, observation, participant. This is the smallest detail.
+
+Hopefully, this explains sufficiently what was going on under the hood. The beauty of tidymodels is that it all happened at once in a unified approach - imagine running eight different models.
+
+```{r run_kmeans_analysis, eval=FALSE, echo=TRUE}
+# Run the k-mean algorithm on the aggregated data
+kmeans_summary <- 
+  tibble(k = 1:8) %>%
+  mutate(
+    # Do the cluster analysis from one to 8 clusters
+    kmeans = map(k, ~kmeans(aggregated_gin, centers = .x)),
+    # Show a summary per each cluster
+    kmeans_tidy = map(kmeans, tidy),
+    # Show a summary of key statistics
+    kmeans_glan = map(kmeans, glance),
+    # Clusters with the original data
+    kmeans_augm = map(kmeans, augment, aggregated_gin)
+  )
+
+# glance() function extracts a summary stats for models
+clusters_statistics <- kmeans_summary %>%
+  unnest(cols = c(kmeans_glan))
+
+# tidy() function summarizes per cluster stats
+clusters_summary <- kmeans_summary %>%
+  unnest(cols = c(kmeans_tidy))
+
+# augment adds predicted classifications to the original data set
+data_predicted <- kmeans_summary %>% 
+  unnest(cols = c(kmeans_augm))
+```
+
+To understand these data, I use visualisation. That is the most intuitive approach (aside from also looking at the statistics outputs).
+
+First, I wanted to show so-called model in data view where predicted clusters are plotted in data.
+
+```{r plot_predicted_clusters, fig.height = 8, fig.width = 9, fig.align = "center"}
+# Show the visualisation of predicted clusters across the data
+gg_predicted
+```
+
+Next, each cluster has a centre or centroid, an area that was used to associate the clusters with - as shown in graph below.
+
+```{r plot_cluster_centers, fig.height = 8, fig.width = 9, fig.align = "center"}
+# Show the predicted clusters and their centroids
+gg_centres
+```
+
+Then, I manually filtered clusters close to those centroids and labelled them. This gave me an idea of what was a good representation of each cluster - it was usually the drink closest to the centre.
+
+```{r plot_cluster_labels, fig.height = 12, fig.width = 12, fig.align = "center"}
+# Visualise the predicted clusters with labels
+gg_predicted_labels
+```
+
+## Choosing the optimal k
+
+Several sophisticated methods can be utilised to diagnose the cluster analysis via k-means. Particularly intuitive is the so-called elbow method which shows the total within the sum of squares across each iteration (the top-level - glance output). 
+
+Following this method, I can settle on the number of clusters where total within the sum of squares was minimised and pick specific iteration. However, I am looking for a drop or change, not the lowest value per se as I also want a reasonable number of clusters (the more is not the merrier) - parsimony.
+
+Judging from the data visualisation shown before I would go for either two or three clusters as the change from that point was smaller.
+
+```{r plot_elbow_method, fig.height = 8, fig.width = 9, fig.align = "center"}
+# Show the elbow graph
+gg_elbow
+```
+
+## Conclusion
+
+I hope you enjoyed reading this analysis of Tidy Tuesday dataset. Hopefully, it piqued your interest in the k-means algorithm and tidymodels. Using this framework is elegant and powerful.
+
+I also illustrated how to conduct this type of analysis from initial data exploration to the final result (part I to part II). You may wonder what is the interpretation, I leave it up to you to determine what defines each cluster.
+
+Thank you for reading my blog post. Please feel free to let me know any comments or feedback. Feel free to also reuse any of the parts with appropriate attribution.
+
+
+### Reproducibility disclaimer
+Please note that this is an older post. While I can guarantee that the code below will work at time the post was published, R packages are updated regularly and it is possible that the code will not work in the future. Please see below the R.version to see the last time the code was checked. Future post will improve on this.
+
+```{r r_version_info, message=FALSE, warning=FALSE}
+R.version
+```
